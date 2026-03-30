@@ -283,10 +283,6 @@ def main():
 
     with open(result_file, "w") as rfile, open(jsonl_output_file, "w") as jfile:
         for i in tqdm(range(len(test_dataset)), desc="LLM Localization"):
-            label = test_labels[i]
-            if label == 0:
-                continue
-
             # ---- Split into MSUs (reuses repo functions) ----
             req = test_dataset[i]
             msu_list = msu_splitter(req)
@@ -309,11 +305,24 @@ def main():
                     pred = 0
                 predictions.append(1 if pred else 0)
 
-            # ---- Convert predictions to suspected_attacks format ----
+            label = test_labels[i]
+
+            # ---- Write JSONL output for every sample ----
+            jfile.write(json.dumps({
+                "index": i,
+                "label": label,
+                "msu_list": msu_list,
+                "predictions": predictions,
+            }) + "\n")
+
+            # ---- Evaluate localization metrics only for malicious samples ----
+            if label == 0:
+                continue
+
+            # Convert predictions to suspected_attacks format
             # The repo's check_payload_accuracy_* expects list of (msu_text, score)
             suspected_attacks = [(msu, 1.0) for msu, pred in zip(msu_list, predictions) if pred == 1]
 
-            # ---- Evaluate using repo's metrics ----
             precision, recall, f1_score, accuracy, jaccard_index, ulocation, attacks = (
                 analyze_attacks_accuracy(dataset_type, test_data_json[i],
                                         suspected_attacks, len(msu_list))
@@ -330,24 +339,11 @@ def main():
             all_accuracy.append(accuracy)
             all_jaccard_index.append(jaccard_index)
 
-            # ---- Write detailed result ----
+            # ---- Write detailed result for malicious samples ----
             original_text = f"Method:{req.method} URL:{req.url} Body:{req.body}".strip()
             write_result(rfile, original_text, msu_list, predictions,
                          ground_truth_labels, precision, recall, f1_score,
                          accuracy, jaccard_index, attacks, ulocation)
-
-            # ---- Write JSONL output ----
-            jfile.write(json.dumps({
-                "index": i,
-                "msu_list": msu_list,
-                "predictions": predictions,
-                "ground_truth": ground_truth_labels,
-                "precision": precision,
-                "recall": recall,
-                "f1_score": f1_score,
-                "accuracy": accuracy,
-                "jaccard_index": jaccard_index,
-            }) + "\n")
 
             total_count += 1
 
