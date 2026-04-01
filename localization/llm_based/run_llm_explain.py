@@ -23,6 +23,7 @@ import json
 import time
 import argparse
 import re
+from urllib.parse import unquote_plus
 from tqdm import tqdm
 
 sys.path.append(".")
@@ -96,11 +97,24 @@ def build_prompt(msu_list: list[str]) -> list[dict]:
 # MSU splitting (reuses repo functions, selects by dataset)
 # ---------------------------------------------------------------------------
 def get_msu_splitter(dataset: str):
-    """Return the appropriate MSU splitting function for the dataset."""
+    """Return the appropriate MSU splitting function for the dataset.
+
+    The raw split functions return URL-encoded MSUs.  The normal pipeline
+    decodes them via ``unquote_plus`` inside the tokenizer (e.g.
+    ``char_tokenizer_with_http_level_alignment_furl_header``).  All
+    downstream metric functions expect decoded text, so we wrap the
+    splitter to apply the same decoding step.
+    """
     if dataset == "pkdd":
-        return get_http_level_split_furl_header
+        raw_splitter = get_http_level_split_furl_header
     else:
-        return get_http_level_split
+        raw_splitter = get_http_level_split
+
+    def _split_and_decode(req):
+        return [unquote_plus(msu, encoding="utf-8", errors="replace")
+                for msu in raw_splitter(req)]
+
+    return _split_and_decode
 
 
 # ---------------------------------------------------------------------------
