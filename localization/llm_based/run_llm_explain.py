@@ -23,6 +23,7 @@ import json
 import time
 import argparse
 import re
+from urllib.parse import unquote_plus
 from tqdm import tqdm
 
 sys.path.append(".")
@@ -96,11 +97,24 @@ def build_prompt(msu_list: list[str]) -> list[dict]:
 # MSU splitting (reuses repo functions, selects by dataset)
 # ---------------------------------------------------------------------------
 def get_msu_splitter(dataset: str):
-    """Return the appropriate MSU splitting function for the dataset."""
+    """Return the appropriate MSU splitting function for the dataset.
+
+    The raw split functions return URL-encoded MSUs.  The normal pipeline
+    decodes them via ``unquote_plus`` inside the tokenizer (e.g.
+    ``char_tokenizer_with_http_level_alignment_furl_header``).  All
+    downstream metric functions expect decoded text, so we wrap the
+    splitter to apply the same decoding step.
+    """
     if dataset == "pkdd":
-        return get_http_level_split_furl_header
+        raw_splitter = get_http_level_split_furl_header
     else:
-        return get_http_level_split
+        raw_splitter = get_http_level_split
+
+    def _split_and_decode(req):
+        return [unquote_plus(msu, encoding="utf-8", errors="replace")
+                for msu in raw_splitter(req)]
+
+    return _split_and_decode
 
 
 # ---------------------------------------------------------------------------
@@ -273,9 +287,9 @@ def main():
     all_f1_scores = []
     all_accuracy = []
     all_jaccard_index = []
+    all_exact_match = []
 
     total_count = 0
-    parse_failure_count = 0
     total_time_start = time.time()
 
     result_file = os.path.join(outputdir, "results.txt")
@@ -307,15 +321,30 @@ def main():
 
             label = test_labels[i]
 
+            # ---- Get ground truth for every sample ----
+            # Benign samples: all MSUs are 0. Malicious: use dataset annotations.
+            if label == 0:
+                ground_truth_labels = [0] * len(msu_list)
+            else:
+                ground_truth_labels = get_location_ground_truth(
+                    dataset_type, test_data_json[i], msu_list
+                )
+
+            # ---- Exact match: correct only if every MSU prediction matches GT ----
+            exact_match = int(predictions == ground_truth_labels)
+            all_exact_match.append(exact_match)
+
             # ---- Write JSONL output for every sample ----
             jfile.write(json.dumps({
                 "index": i,
                 "label": label,
                 "msu_list": msu_list,
                 "predictions": predictions,
+                "ground_truth": ground_truth_labels,
+                "exact_match": exact_match,
             }) + "\n")
 
-            # ---- Evaluate localization metrics only for malicious samples ----
+            # ---- Per-sample localization metrics only for malicious samples ----
             if label == 0:
                 continue
 
@@ -326,11 +355,6 @@ def main():
             precision, recall, f1_score, accuracy, jaccard_index, ulocation, attacks = (
                 analyze_attacks_accuracy(dataset_type, test_data_json[i],
                                         suspected_attacks, len(msu_list))
-            )
-
-            # Get per-MSU ground truth for detailed output
-            ground_truth_labels = get_location_ground_truth(
-                dataset_type, test_data_json[i], msu_list
             )
 
             all_precision.append(precision)
@@ -354,15 +378,22 @@ def main():
     # ---- Report aggregate metrics ----
     total_time = time.time() - total_time_start
 
+    total_samples = len(all_exact_match)
+    overall_exact_match = sum(all_exact_match) / total_samples if total_samples > 0 else 0
+
     print(f"\n{'='*60}")
     print(f"LLM-based Localization Results")
     print(f"{'='*60}")
     print(f"Dataset:          {dataset_type.upper()}")
     print(f"Model:            {args.model}")
-    print(f"Total samples:    {total_count}")
+    print(f"Total samples:    {total_samples} (benign + malicious)")
+    print(f"Malicious samples:{total_count}")
     print(f"Total time:       {total_time:.2f}s")
-    if total_count > 0:
-        print(f"Avg time/sample:  {total_time / total_count:.2f}s")
+    if total_samples > 0:
+        print(f"Avg time/sample:  {total_time / total_samples:.2f}s")
+
+    # Overall exact match accuracy (all samples: correct iff every MSU matches GT)
+    print(f"\nOverall Exact Match Accuracy: {overall_exact_match:.4f} ({sum(all_exact_match)}/{total_samples})")
 
     if total_count > 0:
         avg_precision, avg_recall, avg_f1, avg_acc, avg_jaccard = (
@@ -371,19 +402,22 @@ def main():
                 all_accuracy, all_jaccard_index
             )
         )
-        print(f"\nAvg Precision:    {avg_precision:.4f}")
-        print(f"Avg Recall:       {avg_recall:.4f}")
-        print(f"Avg F1 Score:     {avg_f1:.4f}")
-        print(f"Avg Accuracy:     {avg_acc:.4f}")
-        print(f"Avg Jaccard:      {avg_jaccard:.4f}")
+        print(f"\nMalicious-only localization metrics:")
+        print(f"  Avg Precision:    {avg_precision:.4f}")
+        print(f"  Avg Recall:       {avg_recall:.4f}")
+        print(f"  Avg F1 Score:     {avg_f1:.4f}")
+        print(f"  Avg Accuracy:     {avg_acc:.4f}")
+        print(f"  Avg Jaccard:      {avg_jaccard:.4f}")
 
         # Write summary
         summary_file = os.path.join(outputdir, "summary.txt")
         with open(summary_file, "w") as f:
             f.write(f"Dataset: {dataset_type.upper()}\n")
             f.write(f"Model: {args.model}\n")
-            f.write(f"Total samples: {total_count}\n")
+            f.write(f"Total samples: {total_samples}\n")
+            f.write(f"Malicious samples: {total_count}\n")
             f.write(f"Total time: {total_time:.2f}s\n")
+            f.write(f"Overall Exact Match Accuracy: {overall_exact_match:.4f} ({sum(all_exact_match)}/{total_samples})\n")
             f.write(f"Avg Precision: {avg_precision:.4f}\n")
             f.write(f"Avg Recall: {avg_recall:.4f}\n")
             f.write(f"Avg F1 Score: {avg_f1:.4f}\n")
